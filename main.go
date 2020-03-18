@@ -7,6 +7,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"os"
+	"path"
 	"strings"
 	"sync"
 	"text/template"
@@ -34,16 +35,28 @@ func listDir(dir *os.File) (map[string]bool, error) {
 	return pages, nil
 }
 
-func (s *server) refresh() {
+func (s *server) refresh() error {
 	s.pMu.Lock()
 	defer s.pMu.Unlock()
 	pages, err := listDir(s.pagesDir)
 	if err != nil {
-		fmt.Printf("failed to refresh pages: %s\n", err)
-		return
+		return err
 	}
 	s.pages = pages
-	fmt.Println(s.pages)
+	return nil
+}
+
+func (s *server) refreshEndpoint(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+	if err := s.refresh(); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(fmt.Sprintf("failed to read pages directory %q: %s", s.pagesDir.Name(), err)))
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	return
 }
 
 var indexTemplate = template.Must(template.New("index").Parse(`<html>
@@ -104,12 +117,11 @@ func (s *server) page(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	page := strings.TrimPrefix(req.URL.Path, "/page/")
-	fmt.Println(page)
 	if _, ok := s.pages[page]; !ok {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
-	content, err := ioutil.ReadFile(page)
+	content, err := ioutil.ReadFile(path.Join(s.pagesDir.Name(), page))
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		// write out error
@@ -138,9 +150,9 @@ var newPage = `<html>
 	<body>
 		<form action="/new">
 			file name:<br>
-			<input type="text" id="fname" name="fname" value=""><br>
+			<input type="text" name="fname" value=""><br>
 			content:<br>
-			<input type="text" id="content" name="lname" value=""><br><br>
+			<textarea name="content" rows="10" cols="30"></textarea><br>
 			<input type="submit" formmethod="post" value="submit">
 		</form>
 	</body>
@@ -151,11 +163,38 @@ func (s *server) new(w http.ResponseWriter, req *http.Request) {
 	case http.MethodGet:
 		w.Write([]byte(newPage))
 	case http.MethodPost:
-		w.Write([]byte("well hello there"))
+		if err := req.ParseForm(); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(fmt.Sprintf("failed to parse form: %s", err)))
+			return
+		}
+
+		w.Write([]byte(fmt.Sprintf("%#v", req.PostForm)))
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+}
+
+func (s *server) delete(w http.ResponseWriter, req *http.Request) {
+	fmt.Println("wee woo")
+	if req.Method != http.MethodPost {
+		fmt.Println("???")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	fmt.Println(req.URL.Path)
+	page := strings.TrimPrefix(req.URL.Path, "/delete/")
+	if _, ok := s.pages[page]; !ok {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	err := os.Remove(path.Join(s.pagesDir.Name(), page))
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
 }
 
 func isDir(f *os.File) error {
@@ -181,18 +220,25 @@ func main() {
 	}
 	if err := isDir(pd); err != nil {
 		fmt.Printf("failed checking pages directory: %s\n", err)
+		os.Exit(1)
 	}
 
 	s := &server{
 		pagesDir: pd,
 	}
-	s.refresh()
+	if err := s.refresh(); err != nil {
+		fmt.Printf("failed to read pages directory: %s\n", err)
+		os.Exit(1)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/page/", s.page)
 	mux.HandleFunc("/new", s.new)
+	mux.HandleFunc("/delete/", s.delete)
+	mux.HandleFunc("/refresh", s.refreshEndpoint)
 	mux.HandleFunc("/", s.index)
 
+	fmt.Printf("listening on %s\n", *listen)
 	err = http.ListenAndServe(*listen, mux)
 	if err != nil {
 		fmt.Printf("http server failed: %s\n", err)
